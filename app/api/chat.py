@@ -1,0 +1,329 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, File, Form, Request, UploadFile
+from fastapi.responses import StreamingResponse
+
+from app.schemas.chat import (
+    ChatHistoryMessage,
+    ChatHistoryResponse,
+    ChatModelOptionsResponse,
+    ChatRequest,
+    ChatSessionListResponse,
+    ClearChatRequest,
+    StopChatRequest,
+)
+
+router = APIRouter()
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _build_turn_record(request: ChatRequest, result: dict, status: str) -> dict:
+    reply = str(result.get("reply") or "").strip()
+    error = result.get("error")
+    latest_status = "回答已生成"
+    error_message = ""
+
+    if status == "stopped":
+        latest_status = "已停止生成"
+    elif status == "error":
+        latest_status = "处理失败"
+        error_message = str(error or "agent 运行失败，请稍后重试。")
+
+    return {
+        "turn_id": f"{request.session_id}-{int(datetime.now(timezone.utc).timestamp() * 1000)}",
+        "session_id": request.session_id,
+        "user_message": request.message.strip(),
+        "assistant_message": reply,
+        "status": status,
+        "created_at": _utc_timestamp(),
+        "context": {
+            "target_city": request.target_city,
+            "job_direction": request.job_direction,
+            "user_profile": request.user_profile,
+            "resume_text": request.resume_text,
+        },
+        "meta": {
+            "run_id": result.get("run_id"),
+            "model_provider": result.get("model_provider") or request.agent_model_provider,
+            "model_name": result.get("model_name"),
+            "latency_ms": result.get("latency_ms"),
+            "used_subagents": result.get("used_subagents") or [],
+            "tool_calls_summary": result.get("tool_calls_summary") or [],
+            "tool_calls": result.get("tool_calls") or [],
+            "sources": result.get("sources") or [],
+            "context_compression": result.get("context_compression") or {},
+            "trace": result.get("trace") or {},
+        },
+        "activity": {
+            "latestStatus": latest_status,
+            "todos": [],
+            "subagents": result.get("used_subagents") or [],
+            "tools": result.get("tool_calls_summary") or [],
+            "toolDetails": result.get("tool_calls") or [],
+            "trace": result.get("trace") or {},
+            "errorMessage": error_message,
+        },
+    }
+
+
+def _expand_turns_to_messages(session_id: str, turns: list[dict]) -> ChatHistoryResponse:
+    messages: list[ChatHistoryMessage] = []
+
+    for turn in turns:
+        user_message = str(turn.get("user_message") or "").strip()
+        if user_message:
+            messages.append(ChatHistoryMessage(role="user", content=user_message))
+
+        assistant_message = str(turn.get("assistant_message") or "").strip()
+        messages.append(
+            ChatHistoryMessage(
+                role="agent",
+                content=assistant_message or ("本次回答已停止。" if turn.get("status") == "stopped" else ""),
+                status=str(turn.get("status") or "done"),
+                meta=turn.get("meta") or {},
+                activity=turn.get("activity") or {},
+            )
+        )
+
+    return ChatHistoryResponse(session_id=session_id, messages=messages)
+
+
+def _build_agent_message(request: ChatRequest) -> str:
+    context_parts: list[str] = []
+
+    if request.user_profile:
+        context_parts.append(f"【用户背景】\n{request.user_profile.strip()}")
+    if request.target_city:
+        context_parts.append(f"【目标城市】\n{request.target_city.strip()}")
+    if request.job_direction:
+        context_parts.append(f"【目标岗位方向】\n{request.job_direction.strip()}")
+    if request.resume_text:
+        context_parts.append(f"【简历文本】\n{request.resume_text.strip()}")
+
+    context_parts.append(f"【用户问题】\n{request.message.strip()}")
+    return "\n\n".join(context_parts)
+
+
+def _format_sse(event: dict) -> str:
+    event_type = event.get("type", "message")
+    data = json.dumps(event, ensure_ascii=False)
+    return f"event: {event_type}\ndata: {data}\n\n"
+
+
+def _empty_chat_result(session_id: str, error: str | None = None) -> dict:
+    return {
+        "reply": "",
+        "session_id": session_id,
+        "run_id": None,
+        "model_provider": None,
+        "model_name": None,
+        "used_subagents": [],
+        "tool_calls_summary": [],
+        "tool_calls": [],
+        "sources": [],
+        "latency_ms": 0,
+        "context_compression": {},
+        "trace": {},
+        "error": error,
+    }
+
+
+async def _stream_chat_request(http_request: Request, request: ChatRequest) -> StreamingResponse:
+    from app.agents.graph import AgentRunError, SessionBusyError, cancel_run, create_run, stream_agent_events
+    from app.rag.chat_memory_store import save_chat_memory
+    from app.services.chat_history_service import save_chat_turn
+
+    message = _build_agent_message(request)
+    try:
+        run = create_run(request.session_id)
+    except SessionBusyError as exc:
+        async def busy_generator():
+            yield _format_sse(
+                {
+                    "type": "error",
+                    "session_id": request.session_id,
+                    "run_id": exc.run_id,
+                    "sequence": 0,
+                    "timestamp": _utc_timestamp(),
+                    "payload": {
+                        "reason": "session_busy",
+                        "message": "当前会话已有回答正在生成，请先停止当前生成或等待完成后再发送。",
+                        "existing_run_id": exc.run_id,
+                    },
+                }
+            )
+
+        return StreamingResponse(
+            busy_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    async def event_generator():
+        final_payload: dict | None = None
+        final_status = "stopped"
+
+        try:
+            async for event in stream_agent_events(
+                message,
+                request.session_id,
+                run.run_id,
+                model_provider=request.agent_model_provider,
+            ):
+                event_type = event.get("type")
+                payload = event.get("payload") or {}
+
+                if event_type == "final":
+                    final_payload = payload
+                    final_status = "error" if payload.get("error") else "done"
+                elif event_type == "error":
+                    final_payload = _empty_chat_result(
+                        request.session_id,
+                        error=payload.get("message") or "agent 运行失败，请稍后重试。",
+                    )
+                    final_status = "error"
+                elif event_type == "stopped":
+                    final_payload = _empty_chat_result(request.session_id)
+                    final_status = "stopped"
+
+                if await http_request.is_disconnected():
+                    cancel_run(run.run_id)
+                    final_status = "stopped"
+                    if final_payload is None:
+                        final_payload = _empty_chat_result(request.session_id)
+                    break
+
+                yield _format_sse(event)
+        except AgentRunError:
+            final_payload = _empty_chat_result(request.session_id, error="agent 运行失败，请稍后重试。")
+            final_status = "error"
+        finally:
+            if final_payload is not None:
+                turn = _build_turn_record(request, final_payload, status=final_status)
+                await save_chat_turn(turn)
+                await save_chat_memory(turn)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _build_chat_request_from_upload(
+    *,
+    resume_file: UploadFile,
+    message: str,
+    session_id: str = "default",
+    agent_model_provider: str = "",
+    user_profile: str = "",
+    target_city: str = "",
+    job_direction: str = "",
+) -> ChatRequest:
+    from app.services.document_service import extract_text_from_pdf_upload
+
+    resume_text = await extract_text_from_pdf_upload(resume_file)
+    return ChatRequest(
+        message=message,
+        session_id=session_id,
+        agent_model_provider=agent_model_provider or None,
+        user_profile=user_profile or None,
+        target_city=target_city or None,
+        job_direction=job_direction or None,
+        resume_text=resume_text,
+    )
+
+
+@router.post("/stream")
+async def chat_stream(http_request: Request, request: ChatRequest):
+    return await _stream_chat_request(http_request, request)
+
+
+@router.post("/stream/upload")
+async def chat_stream_upload(
+    http_request: Request,
+    resume_file: UploadFile = File(..., description="PDF resume file"),
+    message: str = Form(..., description="User message"),
+    session_id: str = Form(default="default", description="Conversation session ID"),
+    agent_model_provider: str = Form(default="", description="Agent model provider"),
+    user_profile: str = Form(default="", description="Optional user background"),
+    target_city: str = Form(default="", description="Optional target city"),
+    job_direction: str = Form(default="", description="Optional target job direction"),
+):
+    request = await _build_chat_request_from_upload(
+        resume_file=resume_file,
+        message=message,
+        session_id=session_id,
+        agent_model_provider=agent_model_provider,
+        user_profile=user_profile,
+        target_city=target_city,
+        job_direction=job_direction,
+    )
+    return await _stream_chat_request(http_request, request)
+
+
+@router.get("/history", response_model=ChatHistoryResponse)
+async def get_chat_history(session_id: str = "default"):
+    from app.services.chat_history_service import get_chat_history as load_chat_history
+
+    turns = await load_chat_history(session_id)
+    return _expand_turns_to_messages(session_id, turns)
+
+
+@router.get("/sessions", response_model=ChatSessionListResponse)
+async def get_chat_sessions():
+    from app.services.chat_history_service import list_chat_sessions
+
+    return ChatSessionListResponse(sessions=await list_chat_sessions())
+
+
+@router.get("/model-options", response_model=ChatModelOptionsResponse)
+async def get_chat_model_options():
+    from app.agents.model_registry import get_agent_model_options
+
+    return ChatModelOptionsResponse(models=get_agent_model_options())
+
+
+@router.post("/clear")
+async def clear_chat(request: ClearChatRequest):
+    from app.agents.graph import clear_session_runtime_state
+    from app.rag.chat_memory_store import clear_chat_memory
+    from app.services.chat_history_service import clear_chat_history
+
+    await clear_chat_history(request.session_id)
+    await clear_chat_memory(request.session_id)
+    await clear_session_runtime_state(request.session_id)
+    return {"ok": True, "session_id": request.session_id}
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_chat_session(session_id: str):
+    from app.agents.graph import clear_session_runtime_state
+    from app.rag.chat_memory_store import clear_chat_memory
+    from app.services.chat_history_service import clear_chat_history
+
+    await clear_chat_history(session_id)
+    await clear_chat_memory(session_id)
+    await clear_session_runtime_state(session_id)
+    return {"ok": True, "session_id": session_id}
+
+
+@router.post("/stop")
+async def stop_chat(request: StopChatRequest):
+    from app.agents.graph import cancel_run
+
+    return {"ok": True, "stopped": cancel_run(request.run_id)}
