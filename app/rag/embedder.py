@@ -1,7 +1,7 @@
 """
 app/rag/embedder.py
 本地 sentence-transformers embedding 封装。
-默认从 E:/Study/model 加载本地模型。
+默认从 localmodel 加载本地模型。
 """
 from __future__ import annotations
 

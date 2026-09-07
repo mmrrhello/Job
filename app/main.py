@@ -14,9 +14,12 @@ from app.config import settings
 from app.api import health, jobs, resume, chat
 
 
+
+# 生命周期管理器 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
+        # 程序执行到这里暂停，关闭服务时会继续执行 finally 里面的代码
         yield
     finally:
         from app.agents.graph import close_agent_runtime

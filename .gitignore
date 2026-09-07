@@ -20,9 +20,9 @@ build/
 venv/
 env/
 data/
-tace/
 .langgraph_api/
-tavily/
+# 只忽略项目根目录的 tavily 产物目录，不影响 skills/tavily/
+/tavily/
 .claude/
 # ═══════════════════════════════════════════
 # IDE
@@ -46,9 +46,10 @@ runtime/
 *.log
 
 # 本地模型文件
-model_local/
+localmodel/
 
 # 个人学习笔记，不上传
+plan/
 STUDY.md
 README_0.md
 QUESTION.md

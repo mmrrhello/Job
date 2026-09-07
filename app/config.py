@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-MODEL_ROOT = Path("model_local/")
+MODEL_ROOT = Path("localmodel/")
 
 
 class ExternalMCPServiceConfig(BaseModel):
@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     enable_retrieval_judge: bool = True
     retrieval_max_retry: int = 1
     retrieval_min_results: int = 3
+    # 判断检索结果质量时，重排分数的最低平均值设为 0.6，此外重排失败或未启用时，只要结果数量足够，也可能直接接受结果
     retrieval_min_rerank_score: float = 0.6
     retrieval_judge_top_k: int = 3
 
@@ -104,6 +105,7 @@ class Settings(BaseSettings):
     context_compression_fallback_recent_chars: int = 6000
 
     # LangGraph checkpoint
+    # 存储Agent的记忆，为了多轮对话连续性，中断恢复，调试回放
     checkpoint_backend: Literal["memory", "sqlite"] = "sqlite"
     checkpoint_sqlite_path: str = "outputs/checkpoints/langgraph.db"
 
@@ -123,6 +125,7 @@ class Settings(BaseSettings):
     tool_security_enabled: bool = True
     tool_allowed_domains: str = ""
     tool_security_redact_inputs: bool = True
+    # 工具输入 → 敏感信息脱敏 → 截取前 160 个字符 → 用于审计或 Trace 展示
     tool_security_preview_chars: int = 160
 
     # MCP
@@ -142,4 +145,5 @@ class Settings(BaseSettings):
     langsmith_api_key: str = ""
 
 
+# 模块单例模式
 settings = Settings()

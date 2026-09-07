@@ -9,6 +9,7 @@ import hashlib
 from typing import Iterator
 
 # 职位描述超过此长度则做滑动切分
+# 800 - 600 = 200 就是说 每个块有200个的重叠字符
 MAX_DESC_LEN = 800
 SLIDE_STEP = 600  # 滑动步长
 
